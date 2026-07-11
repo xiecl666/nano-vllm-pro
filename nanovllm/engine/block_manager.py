@@ -71,7 +71,50 @@ class BlockManager:
         if len(self.free_block_ids) < num_new_blocks:
             return -1
         return num_cached_blocks
-
+    # to impl chunked prefill
+    def num_to_blocks(self,upto_tokens:int):
+        return (upto_tokens+self.block_size-1)//self.block_size
+    
+    def get_cached_prefix(self,seq:Sequence):
+        nums_cached=0
+        h=-1
+        for i in range(seq.num_blocks-1):
+            tokens_id=seq.block(i)
+            h=self.compute_hash(tokens_id,h)
+            block_id=self.hash_to_block_id.get(h,-1)
+            if block_id==-1 or self.blocks[block_id].token_ids!=tokens_id:
+                break
+            nums_cached+=1
+        return nums_cached
+    def attach_cached_prefix(self, seq: Sequence, num_cached_blocks: int):
+        assert not seq.block_table
+        h=-1
+        for i in range(num_cached_blocks):
+            tokens_id=seq.block(i)
+            h=self.compute_hash(tokens_id,h)
+            block_id=self.hash_to_block_id.get(h,-1)
+            block=self.blocks[block_id]
+            if block_id in self.used_block_ids:
+                block.ref_count+=1
+            else:
+                block.ref_count=1
+                self.free_block_ids.remove(block_id)
+                self.used_block_ids.add(block_id)
+            seq.block_table.append(block_id)
+        seq.num_cached_tokens=num_cached_blocks*self.block_size
+    def ensure_allocate(self,seq:Sequence,up_to_tokens:int):
+        need_blocks=num_to_blocks(up_to_tokens)
+        while len(seq.block_table)<need_blocks:
+            seq.block_table.append(self._allocate_block())
+    def truncate(self,seq:Sequence,upto_tokens:int):
+        keep_blocks=self.num_to_blocks(upto_tokens)
+        while(len(seq.block_table)>keep_blocks):
+            block_id=seq.block_table.pop()
+            block=self.blocks[block_id]
+            block.ref_count-=1
+            if block.ref_count==0:
+                self._deallocate_block(block_id)
+    # original code
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
         h = -1

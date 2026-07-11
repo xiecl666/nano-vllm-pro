@@ -47,12 +47,12 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+        scheduleout = self.scheduler.schedule()
+        num_tokens = sum(seq.num_scheduled_tokens for seq in scheduleout.seqs) if scheduleout.has_prefill else -len(scheduleout.seqs)
+        token_ids = self.model_runner.call("run", scheduleout.seqs, scheduleout.has_prefill)
+        self.scheduler.postprocess(scheduleout.seqs, token_ids, scheduleout.has_prefill)
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduleout.seqs if seq.is_finished]
+        return outputs, scheduleout
 
     def is_finished(self):
         return self.scheduler.is_finished()
