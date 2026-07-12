@@ -17,7 +17,7 @@ class Scheduler:
         self.running: deque[Sequence] = deque()
         self.enable_trunked_prefill=config.enable_chunked_prefill
         self.enable_mixed_prefill_decode=config.enable_mixed_prefill_decode
-
+        self.prefill_chunk_size=config.prefill_chunk_size
     def is_finished(self):
         return not self.waiting and not self.running
 
@@ -26,6 +26,8 @@ class Scheduler:
 
     def schedule(self) -> ScheduleOut:
         scheduled_seqs = []
+        token_buget=self.max_num_batched_tokens
+        seq_buget=self.max_num_seqs
         num_batched_tokens = 0
         num_prefill_tokens=0
         num_decode_tokens=0
@@ -36,7 +38,67 @@ class Scheduler:
             for _ in range(num_running):
                 if not self.running:
                     break
-                
+                if token_buget<=0 or len(scheduled_seqs)>=seq_buget:
+                    break
+                seq=self.running.popleft()
+                assert seq.num_cached_tokens==len(seq)-1,(
+                    seq.seq_id,
+                    seq.num_cached_tokens,
+                    len(seq)
+                )
+                while not self.block_manager.can_append(seq):
+                    if self.running:
+                        victim=self.running.pop()
+                        self.preempt(victim)
+                    else:
+                        self.preempt(seq)
+                        seq=None
+                        break
+                if seq is None:
+                    continue
+                seq.is_prefill=False
+                seq.num_scheduled_tokens=1
+                self.block_manager.may_append(seq)
+                scheduled_seqs.append(seq)
+                self.running.append(seq)
+                token_buget-=1
+                num_decode_tokens+=1
+                has_decode=True
+            while self.waiting and token_buget>0 and len(scheduled_seqs)<seq_buget:
+                seq=self.waiting[0]
+                seq.is_prefill=True
+                if not seq.block_table:
+                    num_cached_blocks=self.block_manager.get_cached_prefix(seq)
+                    self.block_manager.attach_cached_prefix(seq,num_cached_blocks)
+                target_len=len(seq)
+                remaining_len=target_len-num_cached_blocks
+                assert remaining_len>0
+                chunk=min(remaining_len,token_buget,self.prefll_chunk_size)
+                end=chunk+num_cached_blocks
+                if not self.block_manager.can_allocat_tokens(seq,end):
+                    break
+                self.block_manager.ensure_allocate(seq,end)
+                seq.num_scheduled_tokens=chunk
+                scheduled_seqs.append(seq)
+                token_buget-=chunk
+                num_prefill_tokens+=chunk
+                has_prefill=True
+                if end==target_len:
+                    self.waiting.popleft()
+                    seq.status=SequenceStatus.RUNNING
+                    self.running.append(seq)
+                else:
+                    break
+            assert scheduled_seqs
+            return ScheduleOut(
+                has_prefill,
+                has_decode,
+                num_prefill_tokens,
+                num_decode_tokens,
+                scheduled_seqs,
+                num_batched_tokens
+            )
+
         else:
             # prefill
             while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
@@ -80,9 +142,16 @@ class Scheduler:
                     seq.is_prefill = False
                     self.block_manager.may_append(seq)
                     scheduled_seqs.append(seq)
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+            assert scheduled_seqs
+            self.running.extendleft(reversed(scheduled_seqs))
+            return ScheduleOut(
+                has_prefill,
+                has_decode,
+                num_prefill_tokens,
+                num_decode_tokens,
+                scheduled_seqs,
+                num_batched_tokens
+            )
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
