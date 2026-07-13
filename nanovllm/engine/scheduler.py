@@ -1,9 +1,17 @@
 from collections import deque
-
+from dataclasses import dataclass 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
+@dataclass
+class ScheduleOut:
+    has_prefill: bool
+    has_decode: bool
+    num_prefill_tokens: int
+    num_decode_tokens: int
+    seqs: list[Sequence]
+    num_batched_tokens: int
 
 class Scheduler:
 
@@ -73,7 +81,7 @@ class Scheduler:
                 target_len=len(seq)
                 remaining_len=target_len-num_cached_blocks
                 assert remaining_len>0
-                chunk=min(remaining_len,token_buget,self.prefll_chunk_size)
+                chunk=min(remaining_len,token_buget,self.prefill_chunk_size)
                 end=chunk+num_cached_blocks
                 if not self.block_manager.can_allocat_tokens(seq,end):
                     break
@@ -172,11 +180,3 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
 
-
-class ScheduleOut:
-    has_prefill: bool
-    has_decode: bool
-    num_prefill_tokens: int
-    num_decode_tokens: int
-    seqs: list[Sequence]
-    num_batched_tokens: int
