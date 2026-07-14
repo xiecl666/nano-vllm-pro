@@ -41,7 +41,7 @@ import random
 import statistics
 import sys
 import time
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from typing import Any
 
 import torch
@@ -656,7 +656,7 @@ def run_interleave(args: argparse.Namespace) -> bool:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Test Chunked Prefill behavior in nano-vLLM.")
     parser.add_argument("--model", required=True, help="Local HF model path, e.g. ~/huggingface/Qwen3-0.6B")
-    parser.add_argument("--mode", choices=["correctness", "interleave", "both"], default="both")
+    parser.add_argument("--mode", choices=["correctness", "interleave", "benchmark", "both", "all"], default="both")
     parser.add_argument("--prompt-len", type=int, default=2048)
     parser.add_argument("--num-prompts", type=int, default=2)
     parser.add_argument("--chunk", type=int, default=512, help="Small max_num_batched_tokens / prefill chunk budget")
@@ -684,10 +684,372 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interleave-steps", type=int, default=200)
     parser.add_argument("--print-rows", type=int, default=20)
 
+    # Benchmark-specific knobs.
+    parser.add_argument("--bench-num-prompts", type=int, default=16, help="Number of prompts for benchmark")
+    parser.add_argument("--bench-prompt-len", type=int, default=2048, help="Prompt length for benchmark")
+    parser.add_argument("--bench-max-tokens", type=int, default=128, help="Max output tokens for benchmark")
+    parser.add_argument("--bench-warmup", type=int, default=1, help="Number of warmup runs before timed run")
+    parser.add_argument("--bench-rounds", type=int, default=3, help="Number of timed rounds for statistics")
+
     # Make the script useful both as a diagnostic and as a CI-style test.
     parser.add_argument("--require-mixed", action="store_true")
     parser.add_argument("--require-incremental-kv", action="store_true")
     return parser.parse_args()
+
+
+# ── Benchmark helpers ──────────────────────────────────────────────────────────
+
+
+@dataclass
+class StepRecord:
+    """Per-step timing and token counts collected during a benchmark run."""
+    step: int
+    wall_sec: float
+    has_prefill: bool
+    has_decode: bool
+    num_prefill_tokens: int
+    num_decode_tokens: int
+    num_seqs: int
+    finished: int  # number of requests that finished this step
+
+
+@dataclass
+class BenchResult:
+    label: str
+    wall_total: float
+    total_prefill_tokens: int
+    total_decode_tokens: int
+    total_output_tokens: int
+    num_steps: int
+    prefill_steps: int
+    decode_steps: int
+    mixed_steps: int
+    prefill_wall: float
+    decode_wall: float
+    prefill_tok_per_sec: float
+    decode_tok_per_sec: float
+    output_tok_per_sec: float
+    ttft_per_request: list[float]  # seconds from t0 to first output token for each request
+    peak_memory_bytes: int | None
+    step_records: list[StepRecord]
+
+
+def _run_bench_pass(
+    *,
+    label: str,
+    model: str,
+    args: argparse.Namespace,
+    prompts: list[list[int]],
+    max_tokens: int,
+    chunked: bool,
+    budget: int,
+) -> BenchResult:
+    set_seed(args.seed)
+    llm, _ = build_llm(
+        model=model,
+        args=args,
+        max_num_batched_tokens=budget,
+        chunked=chunked,
+        label=label,
+    )
+    sp_list = make_sampling_params(len(prompts), max_tokens)
+    for prompt, sp in zip(prompts, sp_list):
+        llm.add_request(prompt, sp)
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+    # Track TTFT: seq_id -> time of first output token
+    ttft_map: dict[int, float] = {}
+    finished_set: set[int] = set()
+    records: list[StepRecord] = []
+    t0 = time.perf_counter()
+    step_idx = 0
+
+    while not llm.is_finished():
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        step_t0 = time.perf_counter()
+        outputs, sched_out = llm.step()
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        step_wall = time.perf_counter() - step_t0
+
+        n_prefill = getattr(sched_out, "num_prefill_tokens", 0)
+        n_decode = getattr(sched_out, "num_decode_tokens", 0)
+        has_p = getattr(sched_out, "has_prefill", False)
+        has_d = getattr(sched_out, "has_decode", False)
+        now = time.perf_counter() - t0
+
+        finished_this_step = 0
+        for seq_id, token_ids in outputs:
+            if seq_id not in finished_set:
+                finished_set.add(seq_id)
+                finished_this_step += 1
+            if seq_id not in ttft_map:
+                ttft_map[seq_id] = now
+
+        # For requests still in decode, record TTFT on first decode step
+        for seq in sched_out.seqs:
+            sid = getattr(seq, "seq_id", -1)
+            if sid not in ttft_map and not getattr(seq, "is_prefill", True):
+                ttft_map[sid] = now
+
+        records.append(StepRecord(
+            step=step_idx,
+            wall_sec=step_wall,
+            has_prefill=has_p,
+            has_decode=has_d,
+            num_prefill_tokens=n_prefill,
+            num_decode_tokens=n_decode,
+            num_seqs=len(sched_out.seqs),
+            finished=finished_this_step,
+        ))
+        step_idx += 1
+
+    total_wall = time.perf_counter() - t0
+    peak_mem = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else None
+    shutdown_llm(llm)
+
+    total_prefill = sum(r.num_prefill_tokens for r in records)
+    total_decode = sum(r.num_decode_tokens for r in records)
+    prefill_steps = sum(1 for r in records if r.has_prefill and not r.has_decode)
+    decode_steps = sum(1 for r in records if r.has_decode and not r.has_prefill)
+    mixed_steps = sum(1 for r in records if r.has_prefill and r.has_decode)
+    prefill_wall = sum(r.wall_sec for r in records if r.has_prefill and not r.has_decode)
+    decode_wall = sum(r.wall_sec for r in records if r.has_decode and not r.has_prefill)
+    mixed_wall = sum(r.wall_sec for r in records if r.has_prefill and r.has_decode)
+    prefill_wall += mixed_wall  # mixed steps also do prefill work
+    decode_wall += mixed_wall  # mixed steps also do decode work
+
+    # TTFT: sorted by request order
+    ttft_list = [ttft_map.get(i, total_wall) for i in range(len(prompts))]
+
+    return BenchResult(
+        label=label,
+        wall_total=total_wall,
+        total_prefill_tokens=total_prefill,
+        total_decode_tokens=total_decode,
+        total_output_tokens=total_decode,
+        num_steps=len(records),
+        prefill_steps=prefill_steps,
+        decode_steps=decode_steps,
+        mixed_steps=mixed_steps,
+        prefill_wall=prefill_wall,
+        decode_wall=decode_wall,
+        prefill_tok_per_sec=total_prefill / prefill_wall if prefill_wall > 0 else 0,
+        decode_tok_per_sec=total_decode / decode_wall if decode_wall > 0 else 0,
+        output_tok_per_sec=total_decode / total_wall if total_wall > 0 else 0,
+        ttft_per_request=ttft_list,
+        peak_memory_bytes=peak_mem,
+        step_records=records,
+    )
+
+
+def _print_bench_result(res: BenchResult) -> None:
+    print(f"\n{'='*60}")
+    print(f"  {res.label}")
+    print(f"{'='*60}")
+    print(f"  Total wall time:       {res.wall_total:.3f} s")
+    print(f"  Total steps:           {res.num_steps}")
+    print(f"    Prefill-only steps:  {res.prefill_steps}")
+    print(f"    Decode-only steps:   {res.decode_steps}")
+    print(f"    Mixed steps:         {res.mixed_steps}")
+    print(f"  Prefill tokens:        {res.total_prefill_tokens}")
+    print(f"  Decode (output) tokens:{res.total_decode_tokens}")
+    print(f"  Prefill throughput:    {res.prefill_tok_per_sec:.1f} tok/s")
+    print(f"  Decode throughput:     {res.decode_tok_per_sec:.1f} tok/s")
+    print(f"  Output tok/s (total):  {res.output_tok_per_sec:.1f} tok/s")
+    if res.peak_memory_bytes is not None:
+        print(f"  Peak GPU memory:       {res.peak_memory_bytes / 1e9:.3f} GB")
+    if res.ttft_per_request:
+        ttft = res.ttft_per_request
+        print(f"  TTFT (first token):")
+        print(f"    min={min(ttft):.4f}s  median={statistics.median(ttft):.4f}s  "
+              f"max={max(ttft):.4f}s  mean={statistics.mean(ttft):.4f}s")
+
+
+def _print_comparison(baseline: BenchResult, chunked: BenchResult) -> None:
+    print(f"\n{'='*60}")
+    print(f"  PERFORMANCE COMPARISON: baseline vs chunked")
+    print(f"{'='*60}")
+
+    def _pct(a, b):
+        if b == 0:
+            return "n/a"
+        diff = (a - b) / b * 100
+        sign = "+" if diff > 0 else ""
+        return f"{sign}{diff:.1f}%"
+
+    print(f"  {'Metric':<28} {'Baseline':>14} {'Chunked':>14} {'Diff':>10}")
+    print(f"  {'-'*66}")
+    rows = [
+        ("Wall time (s)", baseline.wall_total, chunked.wall_total, False),
+        ("Output tok/s", baseline.output_tok_per_sec, chunked.output_tok_per_sec, True),
+        ("Prefill tok/s", baseline.prefill_tok_per_sec, chunked.prefill_tok_per_sec, True),
+        ("Decode tok/s", baseline.decode_tok_per_sec, chunked.decode_tok_per_sec, True),
+        ("TTFT median (s)", statistics.median(baseline.ttft_per_request) if baseline.ttft_per_request else 0,
+         statistics.median(chunked.ttft_per_request) if chunked.ttft_per_request else 0, False),
+        ("TTFT max (s)", max(baseline.ttft_per_request) if baseline.ttft_per_request else 0,
+         max(chunked.ttft_per_request) if chunked.ttft_per_request else 0, False),
+        ("Total steps", float(baseline.num_steps), float(chunked.num_steps), False),
+        ("Mixed steps", float(baseline.mixed_steps), float(chunked.mixed_steps), True),
+    ]
+    if baseline.peak_memory_bytes is not None and chunked.peak_memory_bytes is not None:
+        rows.append(("Peak mem (GB)",
+                      baseline.peak_memory_bytes / 1e9,
+                      chunked.peak_memory_bytes / 1e9, False))
+
+    for name, bv, cv, higher_better in rows:
+        diff = _pct(cv, bv)
+        print(f"  {name:<28} {bv:>14.3f} {cv:>14.3f} {diff:>10}")
+
+    # Interpretation
+    print(f"\n  Interpretation:")
+    if chunked.output_tok_per_sec > 0 and baseline.output_tok_per_sec > 0:
+        ratio = chunked.output_tok_per_sec / baseline.output_tok_per_sec
+        if ratio > 1.05:
+            print(f"    [WIN] Chunked prefill output throughput is {ratio:.2f}x higher")
+        elif ratio < 0.95:
+            print(f"    [REG] Chunked prefill output throughput is {ratio:.2f}x lower")
+        else:
+            print(f"    [TIE] Output throughput is similar ({ratio:.2f}x)")
+
+    if baseline.ttft_per_request and chunked.ttft_per_request:
+        b_med = statistics.median(baseline.ttft_per_request)
+        c_med = statistics.median(chunked.ttft_per_request)
+        if b_med > 0:
+            ratio = c_med / b_med
+            if ratio < 0.95:
+                print(f"    [WIN] Chunked prefill TTFT median is {ratio:.2f}x lower (faster)")
+            elif ratio > 1.05:
+                print(f"    [REG] Chunked prefill TTFT median is {ratio:.2f}x higher (slower)")
+            else:
+                print(f"    [TIE] TTFT median is similar ({ratio:.2f}x)")
+
+    if chunked.mixed_steps > 0 and baseline.mixed_steps == 0:
+        print(f"    [WIN] Chunked prefill enables mixed prefill+decode batching "
+              f"({chunked.mixed_steps} mixed steps)")
+
+
+def run_benchmark(args: argparse.Namespace) -> bool:
+    print("\n######## performance benchmark: baseline vs chunked ########")
+
+    # Build prompts
+    tokenizer_probe, _ = build_llm(
+        model=args.model,
+        args=args,
+        max_num_batched_tokens=max(args.bench_prompt_len, 1),
+        chunked=False,
+        label="bench-tokenizer",
+    )
+    prompts = make_prompts(tokenizer_probe.tokenizer, args.bench_prompt_len, args.bench_num_prompts)
+    shutdown_llm(tokenizer_probe)
+    print(f"Benchmark config: {args.bench_num_prompts} prompts x {args.bench_prompt_len} tokens, "
+          f"max_tokens={args.bench_max_tokens}, chunk={args.chunk}, rounds={args.bench_rounds}")
+
+    baseline_budget = args.baseline_budget or max(args.bench_prompt_len + 16, args.chunk * 4)
+    baseline_budget = max(baseline_budget, args.bench_prompt_len)
+
+    # Warmup
+    for w in range(args.bench_warmup):
+        print(f"\n--- warmup round {w+1}/{args.bench_warmup} ---")
+        _run_bench_pass(
+            label="warmup-baseline", model=args.model, args=args,
+            prompts=prompts, max_tokens=args.bench_max_tokens,
+            chunked=False, budget=baseline_budget,
+        )
+        _run_bench_pass(
+            label="warmup-chunked", model=args.model, args=args,
+            prompts=prompts, max_tokens=args.bench_max_tokens,
+            chunked=True, budget=args.chunk,
+        )
+
+    # Timed rounds
+    baseline_results: list[BenchResult] = []
+    chunked_results: list[BenchResult] = []
+    for r in range(args.bench_rounds):
+        print(f"\n--- timed round {r+1}/{args.bench_rounds} ---")
+        br = _run_bench_pass(
+            label=f"baseline-r{r}", model=args.model, args=args,
+            prompts=prompts, max_tokens=args.bench_max_tokens,
+            chunked=False, budget=baseline_budget,
+        )
+        _print_bench_result(br)
+        baseline_results.append(br)
+
+        cr = _run_bench_pass(
+            label=f"chunked-r{r}", model=args.model, args=args,
+            prompts=prompts, max_tokens=args.bench_max_tokens,
+            chunked=True, budget=args.chunk,
+        )
+        _print_bench_result(cr)
+        chunked_results.append(cr)
+
+    # Aggregate across rounds
+    def _aggregate(results: list[BenchResult], label: str) -> BenchResult:
+        n = len(results)
+        if n == 1:
+            return results[0]
+        avg_wall = statistics.mean(r.wall_total for r in results)
+        avg_out = statistics.mean(r.output_tok_per_sec for r in results)
+        avg_prefill = statistics.mean(r.prefill_tok_per_sec for r in results)
+        avg_decode = statistics.mean(r.decode_tok_per_sec for r in results)
+        avg_steps = int(statistics.mean(r.num_steps for r in results))
+        avg_mixed = int(statistics.mean(r.mixed_steps for r in results))
+        avg_prefill_steps = int(statistics.mean(r.prefill_steps for r in results))
+        avg_decode_steps = int(statistics.mean(r.decode_steps for r in results))
+        # Average TTFT across requests across rounds
+        all_ttft = [ttft for r in results for ttft in r.ttft_per_request]
+        total_prefill = int(statistics.mean(r.total_prefill_tokens for r in results))
+        total_decode = int(statistics.mean(r.total_decode_tokens for r in results))
+        avg_peak = None
+        peaks = [r.peak_memory_bytes for r in results if r.peak_memory_bytes is not None]
+        if peaks:
+            avg_peak = int(statistics.mean(peaks))
+        return BenchResult(
+            label=f"{label} (avg of {n} rounds)",
+            wall_total=avg_wall,
+            total_prefill_tokens=total_prefill,
+            total_decode_tokens=total_decode,
+            total_output_tokens=total_decode,
+            num_steps=avg_steps,
+            prefill_steps=avg_prefill_steps,
+            decode_steps=avg_decode_steps,
+            mixed_steps=avg_mixed,
+            prefill_wall=avg_wall,
+            decode_wall=avg_wall,
+            prefill_tok_per_sec=avg_prefill,
+            decode_tok_per_sec=avg_decode,
+            output_tok_per_sec=avg_out,
+            ttft_per_request=all_ttft,
+            peak_memory_bytes=avg_peak,
+            step_records=[],
+        )
+
+    baseline_agg = _aggregate(baseline_results, "baseline-no-chunk")
+    chunked_agg = _aggregate(chunked_results, "chunked")
+    _print_comparison(baseline_agg, chunked_agg)
+
+    if args.trace_out and baseline_results:
+        root, ext = os.path.splitext(args.trace_out)
+        # Save step-level detail for the last round
+        import json as _json
+        for tag, res in [("baseline", baseline_results[-1]), ("chunked", chunked_results[-1])]:
+            path = f"{root}.bench.{tag}{ext or '.jsonl'}"
+            os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+            with open(path, "w") as f:
+                for rec in res.step_records:
+                    row = {
+                        "step": rec.step, "wall_sec": rec.wall_sec,
+                        "has_prefill": rec.has_prefill, "has_decode": rec.has_decode,
+                        "num_prefill_tokens": rec.num_prefill_tokens,
+                        "num_decode_tokens": rec.num_decode_tokens,
+                        "num_seqs": rec.num_seqs, "finished": rec.finished,
+                    }
+                    f.write(_json.dumps(row) + "\n")
+            print(f"[trace] wrote {len(res.step_records)} step records to {path}")
+
+    return True
 
 
 def main() -> int:
@@ -719,10 +1081,12 @@ def main() -> int:
         )
 
     all_ok = True
-    if args.mode in ("correctness", "both"):
+    if args.mode in ("correctness", "both", "all"):
         all_ok = run_correctness(args) and all_ok
-    if args.mode in ("interleave", "both"):
+    if args.mode in ("interleave", "both", "all"):
         all_ok = run_interleave(args) and all_ok
+    if args.mode in ("benchmark", "all"):
+        all_ok = run_benchmark(args) and all_ok
 
     print("\nFINAL:", "PASS" if all_ok else "FAIL")
     return 0 if all_ok else 1

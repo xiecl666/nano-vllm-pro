@@ -79,11 +79,6 @@ class BlockManager:
         need_blocks=self.num_to_blocks(upto_tokens)
         need_new_blocks=need_blocks-len(seq.block_table)
         return need_new_blocks<=len(self.free_block_ids)
-
-    def ensure_allocate(self,seq:Sequence,upto_tokens:int):
-        need_blocks=self.num_to_blocks(upto_tokens)
-        while len(seq.block_table)<need_blocks:
-            seq.block_table.append(self._allocate_block())
     
     def get_cached_prefix(self,seq:Sequence):
         nums_cached=0
