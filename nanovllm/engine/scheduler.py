@@ -93,6 +93,7 @@ class Scheduler:
                 end=cached_start+chunk
                 if end < target_len:
                     end = ((end + self.block_size - 1) // self.block_size) * self.block_size
+                    end = min(end,target_len)
                 if not self.block_manager.can_allocate_tokens(seq,end):
                     break
                 chunk = end - cached_start

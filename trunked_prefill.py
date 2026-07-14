@@ -100,7 +100,7 @@ def build_llm(
         raw_kwargs.update(
             {
                 "enable_chunked_prefill": True,
-                "enable_mixed_prefill_decode": False,
+                "enable_mixed_prefill_decode": True,
                 "prefill_chunk_size": args.chunk,
                 "max_num_partial_prefills": args.max_partial_prefills,
             }
@@ -659,7 +659,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["correctness", "interleave", "benchmark", "both", "all"], default="both")
     parser.add_argument("--prompt-len", type=int, default=2048)
     parser.add_argument("--num-prompts", type=int, default=2)
-    parser.add_argument("--chunk", type=int, default=512, help="Small max_num_batched_tokens / prefill chunk budget")
+    parser.add_argument("--chunk", type=int, default=2048, help="Small max_num_batched_tokens / prefill chunk budget")
     parser.add_argument("--baseline-budget", type=int, default=0, help="Large prefill budget for non-chunk baseline; 0 = auto")
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--max-model-len", type=int, default=4096)
