@@ -77,6 +77,8 @@ class Scheduler:
                 num_decode_tokens+=1
                 has_decode=True
             while self.waiting and token_buget>0 and len(scheduled_seqs)<seq_buget:
+                if has_decode and not self.enable_mixed_prefill_decode:
+                    break
                 seq=self.waiting[0]
                 seq.is_prefill=True
                 if not seq.block_table:

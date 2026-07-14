@@ -100,7 +100,7 @@ def build_llm(
         raw_kwargs.update(
             {
                 "enable_chunked_prefill": True,
-                "enable_mixed_prefill_decode": True,
+                "enable_mixed_prefill_decode": False,
                 "prefill_chunk_size": args.chunk,
                 "max_num_partial_prefills": args.max_partial_prefills,
             }
@@ -690,6 +690,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bench-max-tokens", type=int, default=128, help="Max output tokens for benchmark")
     parser.add_argument("--bench-warmup", type=int, default=1, help="Number of warmup runs before timed run")
     parser.add_argument("--bench-rounds", type=int, default=3, help="Number of timed rounds for statistics")
+    # Staggered scenario knobs.
+    parser.add_argument("--bench-num-short", type=int, default=8, help="Staggered: number of short requests in batch A")
+    parser.add_argument("--bench-short-prompt-len", type=int, default=128, help="Staggered: short prompt length")
+    parser.add_argument("--bench-short-max-tokens", type=int, default=128, help="Staggered: short request max output tokens")
+    parser.add_argument("--bench-num-long", type=int, default=4, help="Staggered: number of long requests in batch B")
+    parser.add_argument("--bench-long-prompt-len", type=int, default=2048, help="Staggered: long prompt length")
+    parser.add_argument("--bench-long-max-tokens", type=int, default=64, help="Staggered: long request max output tokens")
 
     # Make the script useful both as a diagnostic and as a CI-style test.
     parser.add_argument("--require-mixed", action="store_true")
@@ -753,8 +760,11 @@ def _run_bench_pass(
         label=label,
     )
     sp_list = make_sampling_params(len(prompts), max_tokens)
+    ordered_seq_ids: list[int] = []
     for prompt, sp in zip(prompts, sp_list):
         llm.add_request(prompt, sp)
+    # Record actual seq_ids in submission order (waiting queue preserves insertion order)
+    ordered_seq_ids = [seq.seq_id for seq in llm.scheduler.waiting]
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -762,7 +772,6 @@ def _run_bench_pass(
 
     # Track TTFT: seq_id -> time of first output token
     ttft_map: dict[int, float] = {}
-    finished_set: set[int] = set()
     records: list[StepRecord] = []
     t0 = time.perf_counter()
     step_idx = 0
@@ -780,18 +789,11 @@ def _run_bench_pass(
         has_d = getattr(sched_out, "has_decode", False)
         now = time.perf_counter() - t0
 
-        finished_this_step = 0
-        for seq_id, token_ids in outputs:
-            if seq_id not in finished_set:
-                finished_set.add(seq_id)
-                finished_this_step += 1
-            if seq_id not in ttft_map:
-                ttft_map[seq_id] = now
-
-        # For requests still in decode, record TTFT on first decode step
+        # Track TTFT: record when each request first produces a completion token
+        # (num_completion_tokens >= 1 after postprocess means first output token is ready).
         for seq in sched_out.seqs:
             sid = getattr(seq, "seq_id", -1)
-            if sid not in ttft_map and not getattr(seq, "is_prefill", True):
+            if sid not in ttft_map and seq.num_completion_tokens >= 1:
                 ttft_map[sid] = now
 
         records.append(StepRecord(
@@ -802,7 +804,7 @@ def _run_bench_pass(
             num_prefill_tokens=n_prefill,
             num_decode_tokens=n_decode,
             num_seqs=len(sched_out.seqs),
-            finished=finished_this_step,
+            finished=len(outputs),
         ))
         step_idx += 1
 
@@ -821,8 +823,8 @@ def _run_bench_pass(
     prefill_wall += mixed_wall  # mixed steps also do prefill work
     decode_wall += mixed_wall  # mixed steps also do decode work
 
-    # TTFT: sorted by request order
-    ttft_list = [ttft_map.get(i, total_wall) for i in range(len(prompts))]
+    # TTFT: sorted by submission order using actual seq_ids
+    ttft_list = [ttft_map.get(sid, total_wall) for sid in ordered_seq_ids]
 
     return BenchResult(
         label=label,
@@ -934,7 +936,18 @@ def _print_comparison(baseline: BenchResult, chunked: BenchResult) -> None:
 def run_benchmark(args: argparse.Namespace) -> bool:
     print("\n######## performance benchmark: baseline vs chunked ########")
 
-    # Build prompts
+    # ── Scenario 1: Batch (all requests arrive at once) ──
+    _run_batch_benchmark(args)
+
+    # ── Scenario 2: Staggered arrival (short first, then long) ──
+    _run_staggered_benchmark(args)
+
+    return True
+
+
+def _run_batch_benchmark(args: argparse.Namespace) -> None:
+    """Batch scenario: all requests arrive at once. Chunked prefill usually loses here."""
+    print("\n── Scenario 1: Batch arrival (all requests at once) ──")
     tokenizer_probe, _ = build_llm(
         model=args.model,
         args=args,
@@ -944,7 +957,7 @@ def run_benchmark(args: argparse.Namespace) -> bool:
     )
     prompts = make_prompts(tokenizer_probe.tokenizer, args.bench_prompt_len, args.bench_num_prompts)
     shutdown_llm(tokenizer_probe)
-    print(f"Benchmark config: {args.bench_num_prompts} prompts x {args.bench_prompt_len} tokens, "
+    print(f"  {args.bench_num_prompts} prompts x {args.bench_prompt_len} tokens, "
           f"max_tokens={args.bench_max_tokens}, chunk={args.chunk}, rounds={args.bench_rounds}")
 
     baseline_budget = args.baseline_budget or max(args.bench_prompt_len + 16, args.chunk * 4)
@@ -952,104 +965,360 @@ def run_benchmark(args: argparse.Namespace) -> bool:
 
     # Warmup
     for w in range(args.bench_warmup):
-        print(f"\n--- warmup round {w+1}/{args.bench_warmup} ---")
-        _run_bench_pass(
-            label="warmup-baseline", model=args.model, args=args,
-            prompts=prompts, max_tokens=args.bench_max_tokens,
-            chunked=False, budget=baseline_budget,
-        )
-        _run_bench_pass(
-            label="warmup-chunked", model=args.model, args=args,
-            prompts=prompts, max_tokens=args.bench_max_tokens,
-            chunked=True, budget=args.chunk,
-        )
+        print(f"\n  --- warmup {w+1}/{args.bench_warmup} ---")
+        _run_bench_pass(label="warmup-baseline", model=args.model, args=args,
+                        prompts=prompts, max_tokens=args.bench_max_tokens,
+                        chunked=False, budget=baseline_budget)
+        _run_bench_pass(label="warmup-chunked", model=args.model, args=args,
+                        prompts=prompts, max_tokens=args.bench_max_tokens,
+                        chunked=True, budget=args.chunk)
 
     # Timed rounds
     baseline_results: list[BenchResult] = []
     chunked_results: list[BenchResult] = []
     for r in range(args.bench_rounds):
-        print(f"\n--- timed round {r+1}/{args.bench_rounds} ---")
-        br = _run_bench_pass(
-            label=f"baseline-r{r}", model=args.model, args=args,
-            prompts=prompts, max_tokens=args.bench_max_tokens,
-            chunked=False, budget=baseline_budget,
-        )
+        print(f"\n  --- round {r+1}/{args.bench_rounds} ---")
+        br = _run_bench_pass(label=f"baseline-r{r}", model=args.model, args=args,
+                             prompts=prompts, max_tokens=args.bench_max_tokens,
+                             chunked=False, budget=baseline_budget)
         _print_bench_result(br)
         baseline_results.append(br)
-
-        cr = _run_bench_pass(
-            label=f"chunked-r{r}", model=args.model, args=args,
-            prompts=prompts, max_tokens=args.bench_max_tokens,
-            chunked=True, budget=args.chunk,
-        )
+        cr = _run_bench_pass(label=f"chunked-r{r}", model=args.model, args=args,
+                             prompts=prompts, max_tokens=args.bench_max_tokens,
+                             chunked=True, budget=args.chunk)
         _print_bench_result(cr)
         chunked_results.append(cr)
 
-    # Aggregate across rounds
-    def _aggregate(results: list[BenchResult], label: str) -> BenchResult:
-        n = len(results)
-        if n == 1:
-            return results[0]
-        avg_wall = statistics.mean(r.wall_total for r in results)
-        avg_out = statistics.mean(r.output_tok_per_sec for r in results)
-        avg_prefill = statistics.mean(r.prefill_tok_per_sec for r in results)
-        avg_decode = statistics.mean(r.decode_tok_per_sec for r in results)
-        avg_steps = int(statistics.mean(r.num_steps for r in results))
-        avg_mixed = int(statistics.mean(r.mixed_steps for r in results))
-        avg_prefill_steps = int(statistics.mean(r.prefill_steps for r in results))
-        avg_decode_steps = int(statistics.mean(r.decode_steps for r in results))
-        # Average TTFT across requests across rounds
-        all_ttft = [ttft for r in results for ttft in r.ttft_per_request]
-        total_prefill = int(statistics.mean(r.total_prefill_tokens for r in results))
-        total_decode = int(statistics.mean(r.total_decode_tokens for r in results))
-        avg_peak = None
-        peaks = [r.peak_memory_bytes for r in results if r.peak_memory_bytes is not None]
-        if peaks:
-            avg_peak = int(statistics.mean(peaks))
-        return BenchResult(
-            label=f"{label} (avg of {n} rounds)",
-            wall_total=avg_wall,
-            total_prefill_tokens=total_prefill,
-            total_decode_tokens=total_decode,
-            total_output_tokens=total_decode,
-            num_steps=avg_steps,
-            prefill_steps=avg_prefill_steps,
-            decode_steps=avg_decode_steps,
-            mixed_steps=avg_mixed,
-            prefill_wall=avg_wall,
-            decode_wall=avg_wall,
-            prefill_tok_per_sec=avg_prefill,
-            decode_tok_per_sec=avg_decode,
-            output_tok_per_sec=avg_out,
-            ttft_per_request=all_ttft,
-            peak_memory_bytes=avg_peak,
-            step_records=[],
-        )
-
-    baseline_agg = _aggregate(baseline_results, "baseline-no-chunk")
-    chunked_agg = _aggregate(chunked_results, "chunked")
+    baseline_agg = _aggregate_results(baseline_results, "baseline-no-chunk")
+    chunked_agg = _aggregate_results(chunked_results, "chunked")
     _print_comparison(baseline_agg, chunked_agg)
 
-    if args.trace_out and baseline_results:
-        root, ext = os.path.splitext(args.trace_out)
-        # Save step-level detail for the last round
-        import json as _json
-        for tag, res in [("baseline", baseline_results[-1]), ("chunked", chunked_results[-1])]:
-            path = f"{root}.bench.{tag}{ext or '.jsonl'}"
-            os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-            with open(path, "w") as f:
-                for rec in res.step_records:
-                    row = {
-                        "step": rec.step, "wall_sec": rec.wall_sec,
-                        "has_prefill": rec.has_prefill, "has_decode": rec.has_decode,
-                        "num_prefill_tokens": rec.num_prefill_tokens,
-                        "num_decode_tokens": rec.num_decode_tokens,
-                        "num_seqs": rec.num_seqs, "finished": rec.finished,
-                    }
-                    f.write(_json.dumps(row) + "\n")
-            print(f"[trace] wrote {len(res.step_records)} step records to {path}")
 
-    return True
+@dataclass
+class StaggeredResult:
+    label: str
+    wall_total: float
+    t0: float  # time origin
+    inject_time: float  # when batch B was injected (relative to t0)
+    # Batch A (short, arrived at t=0)
+    batch_a_ttft: list[float]  # TTFT for each batch A request
+    batch_a_finish_time: list[float]  # finish time for each batch A request
+    # Batch B (long, arrived after batch A was in decode)
+    batch_b_ttft: list[float]  # TTFT for each batch B request (relative to inject_time)
+    batch_b_finish_time: list[float]  # finish time for each batch B request (relative to inject_time)
+    # Decode stall: time between batch B injection and batch A's next decode token
+    decode_stall_sec: float
+    # Step-level stats after injection
+    post_inject_steps: int
+    post_inject_mixed_steps: int
+    post_inject_prefill_steps: int
+    post_inject_decode_steps: int
+    peak_memory_bytes: int | None
+    total_output_tokens: int
+
+
+def _run_staggered_pass(
+    *,
+    label: str,
+    model: str,
+    args: argparse.Namespace,
+    tokenizer,
+    chunked: bool,
+    budget: int,
+) -> StaggeredResult:
+    """Staggered arrival: short requests first, then long requests after they enter decode."""
+    set_seed(args.seed)
+    llm, _ = build_llm(model=model, args=args, max_num_batched_tokens=budget,
+                       chunked=chunked, label=label)
+
+    # Phase 1: submit short requests
+    short_prompts = [make_prompt_tokens(tokenizer, args.bench_short_prompt_len, salt=2000 + i)
+                     for i in range(args.bench_num_short)]
+    short_sp = SamplingParams(temperature=1.0, ignore_eos=True, max_tokens=args.bench_short_max_tokens)
+    for p in short_prompts:
+        llm.add_request(p, short_sp)
+    # Record batch A seq_ids in submission order
+    batch_a_seq_ids = [seq.seq_id for seq in llm.scheduler.waiting]
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    # Run until short requests finish prefill and enter decode
+    for _ in range(50):
+        if not getattr(llm.scheduler, "waiting", []):
+            break
+        llm.step()
+
+    # A few more decode steps to ensure batch A is stable in decode
+    for _ in range(5):
+        if llm.is_finished():
+            break
+        llm.step()
+
+    inject_time = time.perf_counter() - t0
+    print(f"    [{label}] injected {args.bench_num_long} long requests at t={inject_time:.4f}s")
+
+    # Phase 2: inject long requests
+    long_prompts = [make_prompt_tokens(tokenizer, args.bench_long_prompt_len, salt=5000 + i)
+                    for i in range(args.bench_num_long)]
+    long_sp = SamplingParams(temperature=1.0, ignore_eos=True, max_tokens=args.bench_long_max_tokens)
+    for p in long_prompts:
+        llm.add_request(p, long_sp)
+    # Record batch B seq_ids
+    batch_b_seq_ids = [seq.seq_id for seq in llm.scheduler.waiting if seq.seq_id not in set(batch_a_seq_ids)]
+
+    # Track TTFT and finish times
+    ttft_map: dict[int, float] = {}
+    finish_map: dict[int, float] = {}
+    a_sid_set = set(batch_a_seq_ids)
+    post_inject_steps = 0
+    post_inject_mixed = 0
+    post_inject_prefill = 0
+    post_inject_decode = 0
+    total_decode_tokens = 0
+    # Decode stall: track time from injection to first post-inject decode step
+    first_decode_after_inject: float | None = None
+
+    while not llm.is_finished():
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        outputs, sched_out = llm.step()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        now = time.perf_counter() - t0
+        post_inject_steps += 1
+        has_p = getattr(sched_out, "has_prefill", False)
+        has_d = getattr(sched_out, "has_decode", False)
+        if has_p and has_d:
+            post_inject_mixed += 1
+        elif has_p:
+            post_inject_prefill += 1
+        elif has_d:
+            post_inject_decode += 1
+        total_decode_tokens += getattr(sched_out, "num_decode_tokens", 0)
+        # Track first decode step after injection (for decode stall)
+        if has_d and first_decode_after_inject is None:
+            first_decode_after_inject = now
+
+        # Record TTFT
+        for seq in sched_out.seqs:
+            sid = getattr(seq, "seq_id", -1)
+            if sid not in ttft_map and seq.num_completion_tokens >= 1:
+                ttft_map[sid] = now
+        # Record finish
+        for seq_id, _ in outputs:
+            if seq_id not in finish_map:
+                finish_map[seq_id] = now
+
+    total_wall = time.perf_counter() - t0
+    peak_mem = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else None
+    shutdown_llm(llm)
+
+    # Separate batch A and batch B using recorded seq_ids
+    a_sids = batch_a_seq_ids
+    b_sids = batch_b_seq_ids
+
+    batch_a_ttft = [ttft_map.get(sid, total_wall) for sid in a_sids]
+    batch_a_finish = [finish_map.get(sid, total_wall) for sid in a_sids]
+    batch_b_ttft = [(ttft_map.get(sid, total_wall) - inject_time) for sid in b_sids]
+    batch_b_finish = [(finish_map.get(sid, total_wall) - inject_time) for sid in b_sids]
+
+    # Decode stall: time from injection to first decode step after injection.
+    # With chunked: decode runs first each step, so stall ≈ 1 decode step time.
+    # With baseline: prefill blocks everything, stall ≈ entire prefill time.
+    stall = (first_decode_after_inject - inject_time) if first_decode_after_inject else 0.0
+
+    return StaggeredResult(
+        label=label,
+        wall_total=total_wall,
+        t0=t0,
+        inject_time=inject_time,
+        batch_a_ttft=batch_a_ttft,
+        batch_a_finish_time=batch_a_finish,
+        batch_b_ttft=batch_b_ttft,
+        batch_b_finish_time=batch_b_finish,
+        decode_stall_sec=stall,
+        post_inject_steps=post_inject_steps,
+        post_inject_mixed_steps=post_inject_mixed,
+        post_inject_prefill_steps=post_inject_prefill,
+        post_inject_decode_steps=post_inject_decode,
+        peak_memory_bytes=peak_mem,
+        total_output_tokens=total_decode_tokens,
+    )
+
+
+def _print_staggered_result(res: StaggeredResult) -> None:
+    print(f"\n{'='*60}")
+    print(f"  {res.label}")
+    print(f"{'='*60}")
+    print(f"  Total wall time:       {res.wall_total:.3f} s")
+    print(f"  Inject time:           {res.inject_time:.4f} s")
+    print(f"  Post-inject steps:     {res.post_inject_steps} "
+          f"(mixed={res.post_inject_mixed_steps}, "
+          f"prefill={res.post_inject_prefill_steps}, "
+          f"decode={res.post_inject_decode_steps})")
+    if res.batch_a_ttft:
+        a = res.batch_a_ttft
+        print(f"  Batch A (short) TTFT:")
+        print(f"    min={min(a):.4f}s  median={statistics.median(a):.4f}s  max={max(a):.4f}s")
+    if res.batch_b_ttft:
+        b = res.batch_b_ttft
+        print(f"  Batch B (long) TTFT (from injection):")
+        print(f"    min={min(b):.4f}s  median={statistics.median(b):.4f}s  max={max(b):.4f}s")
+    print(f"  Decode stall:          {res.decode_stall_sec:.4f} s")
+    if res.peak_memory_bytes is not None:
+        print(f"  Peak GPU memory:       {res.peak_memory_bytes / 1e9:.3f} GB")
+
+
+def _print_staggered_comparison(baseline: StaggeredResult, chunked: StaggeredResult) -> None:
+    print(f"\n{'='*60}")
+    print(f"  STAGGERED COMPARISON: baseline vs chunked")
+    print(f"{'='*60}")
+
+    def _pct(a, b):
+        if b == 0:
+            return "n/a"
+        diff = (a - b) / b * 100
+        sign = "+" if diff > 0 else ""
+        return f"{sign}{diff:.1f}%"
+
+    print(f"  {'Metric':<32} {'Baseline':>14} {'Chunked':>14} {'Diff':>10}")
+    print(f"  {'-'*70}")
+
+    rows = []
+    # Batch B TTFT (the key metric)
+    if baseline.batch_b_ttft and chunked.batch_b_ttft:
+        b_med = statistics.median(baseline.batch_b_ttft)
+        c_med = statistics.median(chunked.batch_b_ttft)
+        rows.append(("Batch B TTFT median (s)", b_med, c_med, False))
+        rows.append(("Batch B TTFT max (s)", max(baseline.batch_b_ttft), max(chunked.batch_b_ttft), False))
+        rows.append(("Batch B TTFT min (s)", min(baseline.batch_b_ttft), min(chunked.batch_b_ttft), False))
+    # Batch A finish time (did chunked help short requests finish faster?)
+    if baseline.batch_a_finish_time and chunked.batch_a_finish_time:
+        b_med = statistics.median(baseline.batch_a_finish_time)
+        c_med = statistics.median(chunked.batch_a_finish_time)
+        rows.append(("Batch A finish median (s)", b_med, c_med, False))
+    # Decode stall
+    rows.append(("Decode stall (s)", baseline.decode_stall_sec, chunked.decode_stall_sec, False))
+    # Mixed steps
+    rows.append(("Post-inject mixed steps", float(baseline.post_inject_mixed_steps),
+                 float(chunked.post_inject_mixed_steps), True))
+    # Wall time
+    rows.append(("Wall time (s)", baseline.wall_total, chunked.wall_total, False))
+
+    for name, bv, cv, higher_better in rows:
+        diff = _pct(cv, bv)
+        print(f"  {name:<32} {bv:>14.4f} {cv:>14.4f} {diff:>10}")
+
+    print(f"\n  Interpretation:")
+    if baseline.batch_b_ttft and chunked.batch_b_ttft:
+        b_med = statistics.median(baseline.batch_b_ttft)
+        c_med = statistics.median(chunked.batch_b_ttft)
+        if b_med > 0:
+            ratio = c_med / b_med
+            if ratio < 0.95:
+                print(f"    [WIN] Chunked: Batch B TTFT median is {ratio:.2f}x lower "
+                      f"(long requests get first token faster)")
+            elif ratio > 1.05:
+                print(f"    [REG] Chunked: Batch B TTFT median is {ratio:.2f}x higher")
+            else:
+                print(f"    [TIE] Batch B TTFT is similar ({ratio:.2f}x)")
+    if baseline.decode_stall_sec > 0 or chunked.decode_stall_sec > 0:
+        if chunked.decode_stall_sec < baseline.decode_stall_sec:
+            print(f"    [WIN] Chunked: decode stall is lower "
+                  f"({chunked.decode_stall_sec:.4f}s vs {baseline.decode_stall_sec:.4f}s)")
+        elif chunked.decode_stall_sec > baseline.decode_stall_sec:
+            print(f"    [REG] Chunked: decode stall is higher "
+                  f"({chunked.decode_stall_sec:.4f}s vs {baseline.decode_stall_sec:.4f}s)")
+    if chunked.post_inject_mixed_steps > 0 and baseline.post_inject_mixed_steps == 0:
+        print(f"    [WIN] Chunked enables mixed prefill+decode batching "
+              f"({chunked.post_inject_mixed_steps} mixed steps)")
+
+
+def _run_staggered_benchmark(args: argparse.Namespace) -> None:
+    """Staggered scenario: short requests first, then long requests arrive during decode."""
+    print("\n── Scenario 2: Staggered arrival (short → decode → inject long) ──")
+    print(f"  Batch A: {args.bench_num_short} short x {args.bench_short_prompt_len} tokens "
+          f"(max_out={args.bench_short_max_tokens})")
+    print(f"  Batch B: {args.bench_num_long} long x {args.bench_long_prompt_len} tokens "
+          f"(max_out={args.bench_long_max_tokens})")
+
+    # Get tokenizer
+    tokenizer_probe, _ = build_llm(model=args.model, args=args,
+                                   max_num_batched_tokens=max(args.bench_long_prompt_len, 1),
+                                   chunked=False, label="stagger-tokenizer")
+    tokenizer = tokenizer_probe.tokenizer
+    shutdown_llm(tokenizer_probe)
+
+    baseline_budget = args.baseline_budget or max(args.bench_long_prompt_len + 16, args.chunk * 4)
+    baseline_budget = max(baseline_budget, args.bench_long_prompt_len)
+
+    # Warmup
+    for w in range(args.bench_warmup):
+        print(f"\n  --- warmup {w+1}/{args.bench_warmup} ---")
+        _run_staggered_pass(label="warmup-baseline", model=args.model, args=args,
+                            tokenizer=tokenizer, chunked=False, budget=baseline_budget)
+        _run_staggered_pass(label="warmup-chunked", model=args.model, args=args,
+                            tokenizer=tokenizer, chunked=True, budget=args.chunk)
+
+    # Timed rounds
+    baseline_results: list[StaggeredResult] = []
+    chunked_results: list[StaggeredResult] = []
+    for r in range(args.bench_rounds):
+        print(f"\n  --- round {r+1}/{args.bench_rounds} ---")
+        br = _run_staggered_pass(label=f"baseline-r{r}", model=args.model, args=args,
+                                 tokenizer=tokenizer, chunked=False, budget=baseline_budget)
+        _print_staggered_result(br)
+        baseline_results.append(br)
+        cr = _run_staggered_pass(label=f"chunked-r{r}", model=args.model, args=args,
+                                 tokenizer=tokenizer, chunked=True, budget=args.chunk)
+        _print_staggered_result(cr)
+        chunked_results.append(cr)
+
+    # Show first round comparison
+    _print_staggered_comparison(baseline_results[0], chunked_results[0])
+
+
+def _aggregate_results(results: list[BenchResult], label: str) -> BenchResult:
+    n = len(results)
+    if n == 1:
+        return results[0]
+    avg_wall = statistics.mean(r.wall_total for r in results)
+    avg_out = statistics.mean(r.output_tok_per_sec for r in results)
+    avg_prefill = statistics.mean(r.prefill_tok_per_sec for r in results)
+    avg_decode = statistics.mean(r.decode_tok_per_sec for r in results)
+    avg_steps = int(statistics.mean(r.num_steps for r in results))
+    avg_mixed = int(statistics.mean(r.mixed_steps for r in results))
+    avg_prefill_steps = int(statistics.mean(r.prefill_steps for r in results))
+    avg_decode_steps = int(statistics.mean(r.decode_steps for r in results))
+    all_ttft = [ttft for r in results for ttft in r.ttft_per_request]
+    total_prefill = int(statistics.mean(r.total_prefill_tokens for r in results))
+    total_decode = int(statistics.mean(r.total_decode_tokens for r in results))
+    avg_peak = None
+    peaks = [r.peak_memory_bytes for r in results if r.peak_memory_bytes is not None]
+    if peaks:
+        avg_peak = int(statistics.mean(peaks))
+    return BenchResult(
+        label=f"{label} (avg of {n} rounds)",
+        wall_total=avg_wall,
+        total_prefill_tokens=total_prefill,
+        total_decode_tokens=total_decode,
+        total_output_tokens=total_decode,
+        num_steps=avg_steps,
+        prefill_steps=avg_prefill_steps,
+        decode_steps=avg_decode_steps,
+        mixed_steps=avg_mixed,
+        prefill_wall=avg_wall,
+        decode_wall=avg_wall,
+        prefill_tok_per_sec=avg_prefill,
+        decode_tok_per_sec=avg_decode,
+        output_tok_per_sec=avg_out,
+        ttft_per_request=all_ttft,
+        peak_memory_bytes=avg_peak,
+        step_records=[],
+    )
 
 
 def main() -> int:
