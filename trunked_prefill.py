@@ -105,6 +105,13 @@ def build_llm(
                 "max_num_partial_prefills": args.max_partial_prefills,
             }
         )
+    else:
+        raw_kwargs.update(
+            {
+                "enable_chunked_prefill": False,
+                "enable_mixed_prefill_decode": False,
+            }
+        )
 
     kwargs, dropped = filter_config_kwargs(raw_kwargs)
     if dropped and args.print_config:

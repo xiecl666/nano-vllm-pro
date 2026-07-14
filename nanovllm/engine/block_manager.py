@@ -75,6 +75,16 @@ class BlockManager:
     def num_to_blocks(self,upto_tokens:int):
         return (upto_tokens+self.block_size-1)//self.block_size
     
+    def can_allocate_tokens(self,seq:Sequence,upto_tokens:int) ->bool:
+        need_blocks=self.num_to_blocks(upto_tokens)
+        need_new_blocks=need_blocks-len(seq.block_table)
+        return need_new_blocks<=len(self.free_block_ids)
+
+    def ensure_allocate(self,seq:Sequence,upto_tokens:int):
+        need_blocks=self.num_to_blocks(upto_tokens)
+        while len(seq.block_table)<need_blocks:
+            seq.block_table.append(self._allocate_block())
+    
     def get_cached_prefix(self,seq:Sequence):
         nums_cached=0
         h=-1
@@ -101,9 +111,9 @@ class BlockManager:
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
-        seq.num_cached_tokens=num_cached_blocks*self.block_size
+        seq.num_cached_tokens = 0
     def ensure_allocate(self,seq:Sequence,up_to_tokens:int):
-        need_blocks=num_to_blocks(up_to_tokens)
+        need_blocks=self.num_to_blocks(up_to_tokens)
         while len(seq.block_table)<need_blocks:
             seq.block_table.append(self._allocate_block())
     def truncate(self,seq:Sequence,upto_tokens:int):

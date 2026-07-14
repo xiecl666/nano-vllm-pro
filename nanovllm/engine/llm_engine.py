@@ -72,11 +72,11 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
+            output, schedule_out = self.step()
+            if schedule_out.num_batched_tokens > 0:
+                prefill_throughput = schedule_out.num_batched_tokens / (perf_counter() - t)
             else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+                decode_throughput = -schedule_out.num_batched_tokens / (perf_counter() - t)
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",

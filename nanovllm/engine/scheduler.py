@@ -25,7 +25,11 @@ class Scheduler:
         self.running: deque[Sequence] = deque()
         self.enable_trunked_prefill=config.enable_chunked_prefill
         self.enable_mixed_prefill_decode=config.enable_mixed_prefill_decode
-        self.prefill_chunk_size=config.prefill_chunk_size
+        self.prefill_chunk_size=(
+            config.prefill_chunk_size
+            if config.prefill_chunk_size is not None
+            else config.max_num_batched_tokens
+        )
     def is_finished(self):
         return not self.waiting and not self.running
 
@@ -78,12 +82,15 @@ class Scheduler:
                 if not seq.block_table:
                     num_cached_blocks=self.block_manager.get_cached_prefix(seq)
                     self.block_manager.attach_cached_prefix(seq,num_cached_blocks)
+                else:
+                    num_cached_blocks=len(seq.block_table)
+                num_cached_blocks = seq.num_cached_tokens // self.block_size
                 target_len=len(seq)
-                remaining_len=target_len-num_cached_blocks
+                remaining_len=target_len-num_cached_blocks*self.block_size
                 assert remaining_len>0
                 chunk=min(remaining_len,token_buget,self.prefill_chunk_size)
-                end=chunk+num_cached_blocks
-                if not self.block_manager.can_allocat_tokens(seq,end):
+                end=chunk+num_cached_blocks*self.block_size
+                if not self.block_manager.can_allocate_tokens(seq,end):
                     break
                 self.block_manager.ensure_allocate(seq,end)
                 seq.num_scheduled_tokens=chunk
@@ -134,7 +141,14 @@ class Scheduler:
                 scheduled_seqs.append(seq)
 
             if scheduled_seqs:
-                return scheduled_seqs, True
+                return ScheduleOut(
+                    has_prefill,
+                    has_decode,
+                    num_batched_tokens,
+                    0,
+                    scheduled_seqs,
+                    num_batched_tokens
+                )
 
             # decode
             while self.running and len(scheduled_seqs) < self.max_num_seqs:
